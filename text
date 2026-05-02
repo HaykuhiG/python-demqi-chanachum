@@ -1,0 +1,288 @@
+import cv2
+import pytesseract
+import pyttsx3
+import time
+import os
+import numpy as np
+from datetime import datetime
+from collections import deque
+import threading
+import sys
+
+TTS_RATE = 150
+TTS_VOLUME = 0.9
+OCR_LANG = 'eng+hye'
+OCR_CONFIDENCE = 50
+CAMERA_WAIT = 1
+OUTPUT_DIR = "photos"
+
+class SmartTTS:
+    def __init__(self, rate=150, volume=0.9):
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', rate)
+        self.engine.setProperty('volume', volume)
+        self._lock = threading.Lock()
+        self._queue = deque()
+        self._is_speaking = False
+        self._running = True
+        self._setup_voice()
+        self._thread = threading.Thread(target=self._process_queue, daemon=True)
+        self._thread.start()
+
+    def _setup_voice(self):
+        try:
+            voices = self.engine.getProperty('voices')
+            for voice in voices:
+                if 'english' in voice.name.lower() or 'en' in voice.id.lower():
+                    self.engine.setProperty('voice', voice.id)
+                    break
+        except:
+            pass
+
+    def _process_queue(self):
+        while self._running:
+            if self._queue and not self._is_speaking:
+                text = self._queue.popleft()
+                self._is_speaking = True
+                with self._lock:
+                    try:
+                        self.engine.say(text)
+                        self.engine.runAndWait()
+                    except Exception as e:
+                        print(f"[TTS] : {e}")
+                self._is_speaking = False
+            else:
+                time.sleep(0.05)
+
+    def speak(self, text):
+        if text and text.strip():
+            self._queue.append(text.strip())
+            print(f"[TTS] {text}")
+
+    def stop(self):
+        self._running = False
+        self.engine.stop()
+
+class SmartOCR:
+    def __init__(self, lang='eng+hye', confidence=50):
+        self.lang = lang
+        self.confidence = confidence
+        self._check_tesseract()
+
+    def _check_tesseract(self):
+        try:
+            result = os.popen('tesseract --version 2>/dev/null').read()
+            if not result:
+                print("[OCR] Tesseract-ը տեղադրված չէ!")
+        except:
+            pass
+
+    def preprocess(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+        kernel = np.ones((1, 1), np.uint8)
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        return cleaned
+
+    def read_text(self, image_path):
+        image = cv2.imread(image_path)
+        if image is None:
+            return "", 0, ""
+        processed = self.preprocess(image)
+        try:
+            data = pytesseract.image_to_data(processed, lang=self.lang, output_type=pytesseract.Output.DICT)
+            texts = []
+            confidences = []
+            for i, conf in enumerate(data['conf']):
+                if int(conf) > self.confidence:
+                    text = data['text'][i].strip()
+                    if text:
+                        texts.append(text)
+                        confidences.append(int(conf))
+            full_text = ' '.join(texts)
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            lang_detected = self._detect_language(full_text)
+            return full_text, avg_confidence, lang_detected
+        except Exception as e:
+            print(f"[OCR] Սխալ: {e}")
+            return "", 0, ""
+
+    def _detect_language(self, text):
+        if not text:
+            return "unknown"
+        armenian_chars = sum(1 for c in text if '\u0530' <= c <= '\u058F')
+        english_chars = sum(1 for c in text if c.isalpha() and c.isascii())
+        if armenian_chars > english_chars:
+            return "hy"
+        elif english_chars > armenian_chars:
+            return "en"
+        else:
+            return "mixed"
+
+class SmartCamera:
+    def __init__(self, output_dir="photos", wait_time=1):
+        self.output_dir = output_dir
+        self.wait_time = wait_time
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        self._camera = None
+        self._init_camera()
+
+    def _init_camera(self):
+        try:
+            from picamera2 import Picamera2
+            self._camera = Picamera2()
+            self.config = self._camera.create_still_configuration()
+            self._camera.configure(self.config)
+            print("[Camera] Camera-ն պատրաստ է")
+        except ImportError:
+            print("[Camera] picamera2 գրադարանը տեղադրված չէ!")
+            print("    Windows-ում camera-ն չի աշխատի, օգտագործիր test նկար")
+            self._camera = None
+        except Exception as e:
+            print(f"[Camera] Camera-ի սխալ: {e}")
+            self._camera = None
+
+    def take_photo(self):
+        if self._camera is None:
+            return None
+        timestamp = datetime.now().strftime("")[:-3]
+        filename = f"{self.output_dir}/photo_{timestamp}.jpg"
+        try:
+            self._camera.start()
+            time.sleep(self.wait_time)
+            self._camera.capture_file(filename)
+            self._camera.stop()
+            print(f"[Camera] Նկարահանված: {filename}")
+            return filename
+        except Exception as e:
+            print(f"[Camera] Սխալ: {e}")
+            return None
+
+    def cleanup(self):
+        if self._camera:
+            try:
+                self._camera.stop()
+            except:
+                pass
+            self._camera = None
+
+class SmartGlassesKeyboard:
+    def __init__(self):
+        self.tts = SmartTTS(rate=TTS_RATE, volume=TTS_VOLUME)
+        self.ocr = SmartOCR(lang=OCR_LANG, confidence=OCR_CONFIDENCE)
+        self.camera = SmartCamera(output_dir=OUTPUT_DIR, wait_time=CAMERA_WAIT)
+        self.running = True
+
+    def _format_response(self, text, confidence, language):
+        if not text:
+            return "Տեքստ չգտնվեց"
+        if confidence > 80:
+            conf_text = "հստակ"
+        elif confidence > 60:
+            conf_text = "միջին հստակությամբ"
+        else:
+            conf_text = "անորոշ"
+        if len(text) < 80:
+            return f"Տեքստը {conf_text}. {text}"
+        return f"Տեքստը {conf_text}. {text[:80]}..."
+
+    def process_photo(self, photo_path):
+        if not photo_path:
+            self.tts.speak("Նկարահանումը չհաջողվեց")
+            return
+        
+        text, confidence, language = self.ocr.read_text(photo_path)
+        response = self._format_response(text, confidence, language)
+        self.tts.speak(response)
+        
+        print(f"\n[OCR] Տեքստ: {text if text else '[ոչինչ]'}")
+        print(f"[OCR] Վստահություն: {confidence:.1f}%")
+        print(f"[OCR] Լեզու: {language}")
+        print(f"[TTS] {response}\n")
+
+    def capture_and_read(self):
+        print("\n Նկարահանում եմ...")
+        photo = self.camera.take_photo()
+        if photo:
+            self.process_photo(photo)
+        else:
+            print("Camera չի աշխատում, ստեղծում եմ թեստային նկար...")
+            test_img = np.ones((200, 400, 3), dtype=np.uint8) * 255
+            cv2.putText(test_img, "Hello World", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            cv2.putText(test_img, "Բարև Աշխարհ", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            cv2.imwrite("test_image.jpg", test_img)
+            self.process_photo("test_image.jpg")
+
+    def run(self):
+        print("="*50)
+        print("SMART GLASSES (Windows Demo)")
+        print("="*50)
+        print("Սեղմիր Enter-ը նկարելու և կարդալու համար")
+        print("Սեղմիր 'q' և Enter դուրս գալու համար")
+        print("="*50 + "\n")
+        
+        while self.running:
+            user_input = input("Սեղմիր Enter (կամ q+Enter դուրս գալու համար): ")
+            if user_input.lower() == 'q':
+                break
+            self.capture_and_read()
+        
+        self.cleanup()
+
+    def cleanup(self):
+        self.tts.stop()
+        self.camera.cleanup()
+        print("\nԾրագիրն ավարտված է")
+
+if __name__ == "__main__":
+    print("Աշխատում եք Windows-ում (կամ առանց GPIO-ի)")
+    print("Կոճակի փոխարեն օգտագործեք Enter ստեղնը\n")
+    app = SmartGlassesKeyboard()
+    app.run()
+    
+    
+    
+    
+    
+    
+    
+"""Arduino USB Button - Smart Glasses-ի համար
+Երբ կոճակը սեղմվում է, Serial-ով ուղարկում է "CAPTURE"""
+
+const int BUTTON_PIN = 2;
+const int LED_PIN = 13;
+
+int lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 200;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  Serial.println("ARDUINO_READY");
+}
+
+void loop() {
+  int reading = digitalRead(BUTTON_PIN);
+  
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+  
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading == LOW) {
+      digitalWrite(LED_PIN, HIGH);
+      Serial.println("CAPTURE");
+      delay(100);
+      digitalWrite(LED_PIN, LOW);
+    }
+  }
+  
+  lastButtonState = reading;
+  delay(10);
+}
